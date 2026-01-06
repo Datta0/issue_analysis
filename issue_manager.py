@@ -21,7 +21,8 @@ class IssueManager:
         if not self.token:
             raise ValueError("GITHUB_TOKEN not found in environment or arguments.")
 
-        self.g = Github(self.token)
+        # Disable retries to fail fast on Rate Limit (enable Offline Mode)
+        self.g = Github(self.token, retry=0)
         self.repo_name = self.config.get('repo_name')
         self.repo = None
 
@@ -45,7 +46,11 @@ class IssueManager:
         self.repo_name = repo_name
         if self.repo is None: # Only connect if not already connected (e.g. reused)
              print(f"Connecting to repository: {repo_name}...")
-             self.repo = self.g.get_repo(repo_name)
+             try:
+                self.repo = self.g.get_repo(repo_name)
+             except Exception as e:
+                print(f"Warning: Could not connect to repo (Offline/Rate Limit). Operations will use cache only. Error: {e}")
+                self.repo = None
 
     def _load_cache(self):
         if os.path.exists(CACHE_FILE):
@@ -91,35 +96,38 @@ class IssueManager:
     def fetch_issues(self):
         self._load_cache()
 
-        # Decide fetch strategy
-        fetch_kwargs = {'state': 'open'}
-        if self.last_fetch:
-            print(f"Fetching issues updated since {self.last_fetch.isoformat()}...")
-            fetch_kwargs['since'] = self.last_fetch
-        else:
-            print("Fetching ALL open issues (First Run)...")
-
         fetched = []
-        try:
-            fetched = list(self.repo.get_issues(**fetch_kwargs))
-            print(f"Fetched {len(fetched)} updated/new issues.")
-        except Exception as e:
-            print(f"Warning: Failed to fetch updates (Rate Limit/Offline?). Using cache. Error: {e}")
+        if self.repo:
+            # Decide fetch strategy
+            fetch_kwargs = {'state': 'open'}
+            if self.last_fetch:
+                print(f"Fetching issues updated since {self.last_fetch.isoformat()}...")
+                fetch_kwargs['since'] = self.last_fetch
+            else:
+                print("Fetching ALL open issues (First Run)...")
 
-        # Update Cache (Merge)
-        for issue in fetched:
-            # If we simply overwrite, we lose 'last_commenter'.
-            # Only overwrite if updated_at changed OR it's new.
-            # actually 'fetched' only contains updated ones, so we MUST overwrite content,
-            # BUT we should be careful.
-            # If it's a new update, the comments might have changed, so we reset last_commenter to None
-            # to force re-fetch in analysis.
-            # So simple overwrite is correct for 'fetched' items.
-            self.issues_map[int(issue.number)] = self._serialize_issue(issue)
+            try:
+                fetched = list(self.repo.get_issues(**fetch_kwargs))
+                print(f"Fetched {len(fetched)} updated/new issues.")
+            except Exception as e:
+                print(f"Warning: Failed to fetch updates (Rate Limit/Offline?). Using cache. Error: {e}")
 
-        if fetched:
-            self.last_fetch = datetime.datetime.now(datetime.timezone.utc)
-            self._save_cache()
+            # Update Cache (Merge)
+            for issue in fetched:
+                # If we simply overwrite, we lose 'last_commenter'.
+                # Only overwrite if updated_at changed OR it's new.
+                # actually 'fetched' only contains updated ones, so we MUST overwrite content,
+                # BUT we should be careful.
+                # If it's a new update, the comments might have changed, so we reset last_commenter to None
+                # to force re-fetch in analysis.
+                # So simple overwrite is correct for 'fetched' items.
+                self.issues_map[int(issue.number)] = self._serialize_issue(issue)
+
+            if fetched:
+                self.last_fetch = datetime.datetime.now(datetime.timezone.utc)
+                self._save_cache()
+        else:
+            print("Skipping fetch (Offline Mode). Using cache.")
 
         return fetched
 
@@ -131,6 +139,9 @@ class IssueManager:
         Network call to get last commenter. Dedicated for threading.
         Retries could be added here.
         """
+        if not self.repo:
+            return {'last_commenter': None, 'error': 'Offline'}
+
         try:
             gh_issue = self.repo.get_issue(issue_number)
             comments = list(gh_issue.get_comments())
@@ -210,7 +221,7 @@ class IssueManager:
 
         # 1. Fetch live comment info IF MISSING
         # If we already have last_commenter in cache (cached from previous run), skip API call
-        if not issue_data.get('last_commenter'):
+        if not issue_data.get('last_commenter') and self.repo:
             comment_info = self.fetch_last_comment_info(issue_data['number'])
             if comment_info.get('last_commenter'): # Only update if successful
                 issue_data.update(comment_info)
@@ -224,6 +235,11 @@ class IssueManager:
     def execute_action(self, issue_number: int, analysis: Dict[str, Any], verbose: bool = False):
         action = analysis['action']
         if action == 'NONE':
+            return
+
+        # Re-fetch object for action - ONLY IF ONLINE
+        if not self.repo:
+            # print(f"Skipping action (Offline): {action} #{issue_number}")
             return
 
         repo_issue = self.repo.get_issue(issue_number) # Re-fetch object for action
