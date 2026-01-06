@@ -400,7 +400,8 @@ class IssueManager:
         sim_matrix = util.cos_sim(embeddings, embeddings)
 
         # Threshold for "Same Topic"
-        threshold = 0.75
+        # Increased to 0.85 to separate distinct feature requests (e.g. "Add MLX" vs "Add Qwen")
+        threshold = 0.85
 
         # Greedy Clustering
         # List of clusters. Each cluster is list of indices.
@@ -442,8 +443,8 @@ class IssueManager:
             title = documents[primary_doc_idx]['title']
             print(f"{idx+1}. [{len(cluster)} issues] Topic: '{title}'")
             # Print a few examples
-            # for c_idx in cluster[:3]:
-            #     print(f"   - #{documents[c_idx]['number']} {documents[c_idx]['title']}")
+            for c_idx in cluster[:5]:
+                 print(f"   - #{documents[c_idx]['number']} {documents[c_idx]['title']}")
             print("")
 
     def find_similar_for_new(self, title: str, body: str):
