@@ -39,6 +39,13 @@ rules:
     warn_days: 28     # 4 weeks -> Warning zone
     new_issue_window_days: 90 # Issues created within this window get "Notify Team" action instead of warn if stale
 
+# Reporting Configuration
+reporting:
+  enabled: true
+  recent_days: 60       # Issues created in last 60 days
+  min_impact_score: 5   # Minimum score to be listed (Optional)
+  top_n: 10             # Number of issues to show
+
 # Semantic Similarity Settings
 similarity:
   enabled: true

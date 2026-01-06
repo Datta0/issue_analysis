@@ -373,7 +373,7 @@ class IssueManager:
         repo_issue = self.repo.get_issue(issue_number) # Re-fetch object for action
 
         # Detailed Log
-        if verbose or self.mode == 'analysis':
+        if verbose:
              reason = analysis['reason']
              days_inactive = analysis['days']
              last_commenter = analysis.get('last_commenter', 'N/A')
@@ -435,7 +435,15 @@ class IssueManager:
         if self.similarity_engine:
             cache_loaded = self.similarity_engine.load_cache(self.embeddings_cache)
             # Naive re-index for working set to ensure sync
-            docs = [{'number': i['number'], 'title': i['title'], 'body': i['body'], 'html_url': i['html_url']} for i in working_issues]
+            docs = [{
+                'number': i['number'],
+                'title': i['title'],
+                'body': i['body'],
+                'html_url': i['html_url'],
+                'user_login': i['user_login'],
+                'comments_count': i.get('comments_count', 0),
+                'unique_commenters': i.get('unique_commenters', 1)
+            } for i in working_issues]
             self.similarity_engine.index(docs)
             self.similarity_engine.save_cache(self.embeddings_cache)
 
@@ -488,9 +496,100 @@ class IssueManager:
              print("Run with --verbose to see detailed logs.")
              # No return here, allow similarity report to print
 
-        for analysis in analyses:
-             if analysis['action'] != 'NONE':
-                  self.execute_action(analysis['number'], analysis, verbose=verbose)
+        if not verbose and self.mode == 'analysis':
+             print("Run with --verbose to see ALL proposed actions.\n")
+
+        # ---------------------------------------------------------
+        # NEW SECTION: Top Important Recent Issues (High Impact)
+        # ---------------------------------------------------------
+        reporting_config = self.config.get('reporting', {})
+        if reporting_config.get('enabled', True):
+            recent_days = reporting_config.get('recent_days', 60)
+            top_n = reporting_config.get('top_n', 10)
+
+            # Filter: Created recently OR (Updated recently AND High Impact)
+            cutoff_recent = now - datetime.timedelta(days=recent_days)
+
+            # Helper to calculate impact
+            def calculate_impact(issue):
+                users = issue.get('unique_commenters', 1)
+                comments = issue.get('comments_count', 0)
+                if comments is None: comments = 0 # Handle legacy cache
+                return (users * 2) + comments
+
+            filtered_issues = []
+            for i in working_issues:
+                created_dt = datetime.datetime.fromisoformat(i['created_at']).replace(tzinfo=datetime.timezone.utc)
+                updated_dt = datetime.datetime.fromisoformat(i['updated_at']).replace(tzinfo=datetime.timezone.utc)
+
+                # Criteria 1: Recently Created
+                if created_dt >= cutoff_recent:
+                    filtered_issues.append(i)
+                    continue
+
+                # Criteria 2: Old but Active & High Impact
+                # "Recent past" can mean recently active.
+                if updated_dt >= cutoff_recent:
+                    score = calculate_impact(i)
+                    # Use a threshold for "High Impact" on old issues to avoid noise
+                    if score >= reporting_config.get('min_impact_score', 5):
+                        filtered_issues.append(i)
+
+            filtered_issues.sort(key=calculate_impact, reverse=True)
+
+            print(f"\n" + "="*40)
+            print(f"TOP {top_n} IMPORTANT RECENT ISSUES (High Impact)")
+            print(f"Criteria: Created or Active in last {recent_days} days, ranked by Users & Comments")
+            print("="*40)
+
+            # Check for data quality warnings
+            missing_stats = sum(1 for i in filtered_issues if i.get('comments_count') is None)
+            if missing_stats > 0:
+                 print(f"WARNING: {missing_stats} issues have missing stats (legacy cache). Run with GITHUB_TOKEN to refresh.")
+
+            for rank, issue in enumerate(filtered_issues[:top_n]):
+                users = issue.get('unique_commenters', 1)
+                comments = issue.get('comments_count', 0)
+                if comments is None: comments = "?"
+
+                score = calculate_impact(issue)
+                created_dt = datetime.datetime.fromisoformat(issue['created_at']).strftime("%Y-%m-%d")
+
+                print(f"{rank+1}. [Score: {score}] #{issue['number']} {issue['title']}")
+                print(f"    - {users} Users | {comments} Comments | Created: {created_dt}")
+                print(f"    - {issue['html_url']}")
+            print("")
+
+
+        # ---------------------------------------------------------
+        # Show Top 10 High-Impact Issues Requiring Action
+        #  - Prioritize by Engagement (Unique Users / Comments)
+        #  - Then by Age (Days Inactive)
+        # ---------------------------------------------------------
+        actionable = [a for a in analyses if a['action'] != 'NONE']
+
+        # Sort by Impact: (UniqueUsers, TotalComments, DaysInactive) descending
+        actionable.sort(key=lambda x: (
+            x.get('unique_commenters', 0),
+            x.get('comments_count', 0),
+            x['days']
+        ), reverse=True)
+
+        if actionable:
+            print(f"Top 10 Actionable Stale Issues (requiring bot action):")
+            for analysis in actionable[:10]:
+                 reason = analysis['reason']
+                 days = analysis['days']
+                 users = analysis.get('unique_commenters', 1)
+                 comments = analysis.get('comments_count', 0)
+
+                 print(f" - #{analysis['number']} [{analysis['action']}] {analysis['title']}")
+                 print(f"   (Impact: ~{users} users, {comments} comments | Inactive: {days}d | Reason: {reason})")
+            print("")
+
+        # Execute Actions (Silent unless verbose)
+        for analysis in actionable:
+              self.execute_action(analysis['number'], analysis, verbose=verbose)
 
         # 5. Similarity Report (Clusters)
         if self.similarity_engine and self.similarity_engine.corpus_embeddings is not None:
@@ -519,74 +618,130 @@ class IssueManager:
              print("No embeddings to analyze.")
              return
 
-        # Compute NxN Cosine Similarity
+        # ---------------------------------------------------------
+        # 1. Agglomerative Clustering (Hierarchical)
+        # ---------------------------------------------------------
         n = len(documents)
-        print(f"Clustering {n} issues...")
+        print(f"Clustering {n} issues (Agglomerative)...")
 
-        sim_matrix = util.cos_sim(embeddings, embeddings)
+        try:
+            from sklearn.cluster import AgglomerativeClustering
+            from sklearn.manifold import TSNE
+            import plotly.express as px
+            import pandas as pd
+            import numpy as np
+        except ImportError:
+             print("Missing dependencies (sklearn, plotly, pandas). Skipping advanced clustering.")
+             return
 
-        # Threshold for "Same Topic"
-        # Increased to 0.85 to separate distinct feature requests (e.g. "Add MLX" vs "Add Qwen")
-        threshold = 0.85
+        # Convert to numpy
+        X = embeddings.cpu().numpy()
 
-        # Greedy Clustering
-        clusters = []
-        visited = set()
+        # Distance threshold (High = larger clusters).
+        # Using cosine distance, so dist = 1 - sim.
+        # Our sim threshold was 0.85, so dist threshold is 0.15
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=0.25, # Slightly looser than 0.15 because Ward works differently
+            metric='cosine',
+            linkage='average' # Average linkage good for tight semantic groups
+        )
+        labels = model.fit_predict(X)
 
-        # Move to CPU
-        sim_matrix = sim_matrix.cpu()
+        # Group by Cluster ID
+        clusters = {} # id -> list of indices
+        for idx, label in enumerate(labels):
+            if label not in clusters:
+                clusters[label] = []
+            clusters[label].append(idx)
 
-        for i in range(n):
-            if i in visited:
-                continue
+        cluster_list = list(clusters.values())
 
-            cluster = [i]
-            visited.add(i)
+        # Filter out singletons (noise) or keep them? Keep for map, filter for report.
+        report_clusters = [c for c in cluster_list if len(c) > 1] # Only recurring topics
 
-            for j in range(i + 1, n):
-                if j in visited:
-                    continue
-                if sim_matrix[i][j] >= threshold:
-                    cluster.append(j)
-                    visited.add(j)
-
-            if len(cluster) > 1:
-                clusters.append(cluster)
-
-        # Smart Sorting: Impact Score = (Num Issues) + (Total Comments * 0.2)
-        # We weigh issues higher, but comments add "heat"
+        # Smart Sorting: Impact Score
         def get_cluster_stats(cluster_indices):
             num_issues = len(cluster_indices)
-            # Note: documents might not have 'comments_count' if loaded from OLD cache
-            # We assume cache is refreshed or we default to 0
             total_comments = sum(documents[idx].get('comments_count', 0) for idx in cluster_indices)
-            unique_authors = len(set(documents[idx]['user_login'] for idx in cluster_indices)) # Approx users
-            return num_issues, total_comments, unique_authors
+            total_unique_users = sum(documents[idx].get('unique_commenters', 1) for idx in cluster_indices)
+            return num_issues, total_comments, total_unique_users
 
-        clusters.sort(key=lambda c: len(c) + (sum(documents[idx].get('comments_count', 0) for idx in c) * 0.1), reverse=True)
+        report_clusters.sort(key=lambda c: len(c) + (sum(documents[idx].get('unique_commenters', 1) for idx in c) * 0.25), reverse=True)
 
-        print(f"Found {len(clusters)} clusters/topics involving {sum(len(c) for c in clusters)} issues.\n")
+        print(f"Found {len(report_clusters)} significant clusters/topics.\n")
 
         # Print Top 10 Clusters
         print("Top Recurring Issues (Ranked by Impact):")
-        for idx, cluster in enumerate(clusters[:10]):
-            primary_doc_idx = cluster[0]
+        for idx, cluster in enumerate(report_clusters[:10]):
+            # Find closest to centroid for title? Or just first?
+            # Let's pick the one with most comments as 'representative'
+            primary_doc_idx = max(cluster, key=lambda i: documents[i].get('comments_count', 0))
             title = documents[primary_doc_idx]['title']
-            count, comments, authors = get_cluster_stats(cluster)
+            count, comments, users = get_cluster_stats(cluster)
 
-            print(f"{idx+1}. [{count} issues | {comments} comments | ~{authors} users] Topic: '{title}'")
+            print(f"{idx+1}. [{count} issues | ~{users} unique users | {comments} comments] Topic: '{title}'")
 
-            for c_idx in cluster[:5]:
+            for c_idx in cluster[:3]:
                  doc = documents[c_idx]
                  c_count = doc.get('comments_count', 0)
                  print(f"   - #{doc['number']} ({c_count} comments) {doc['title']}")
             print("")
 
+        # ---------------------------------------------------------
+        # 2. Interactive t-SNE Visualization
+        # ---------------------------------------------------------
+        print("Generating t-SNE Map...")
+
+        # Perplexity must be < n_samples
+        perp = min(30, n - 1)
+        tsne = TSNE(n_components=2, perplexity=perp, random_state=42, metric='cosine', init='pca', learning_rate='auto')
+        X_embedded = tsne.fit_transform(X)
+
+        # Prepare Dataframe
+        data = []
+        for i in range(n):
+            doc = documents[i]
+            lbl = labels[i]
+            is_noise = (lbl not in [k for k,v in clusters.items() if len(v) > 1])
+
+            # Label Name (Representative)
+            cluster_rep = "Misc / Single"
+            if not is_noise:
+                 # Find rep title for this cluster
+                 rep_idx = max(clusters[lbl], key=lambda x: documents[x].get('comments_count', 0))
+                 cluster_rep = documents[rep_idx]['title'][:50] + "..."
+
+            data.append({
+                'x': X_embedded[i, 0],
+                'y': X_embedded[i, 1],
+                'Title': doc['title'],
+                'Issue': f"#{doc['number']}",
+                'Comments': doc.get('comments_count', 0),
+                'ClusterID': str(lbl) if not is_noise else "Noise",
+                'Topic': cluster_rep,
+                'User': doc['user_login']
+            })
+
+        df = pd.DataFrame(data)
+
+        fig = px.scatter(
+            df, x='x', y='y',
+            color='Topic',
+            hover_data=['Issue', 'Title', 'Comments', 'User'],
+            title=f"GitHub Issue Landscape ({self.repo_name})",
+            template='plotly_dark'
+        )
+        fig.update_traces(marker=dict(size=8, opacity=0.7))
+
+        map_path = os.path.join(self.output_dir, "map.html")
+        fig.write_html(map_path)
+        print(f"Visualization saved to: {map_path}")
+
     def find_similar_for_new(self, title: str, body: str):
         if not self.similarity_engine:
             print("Similarity engine not enabled.")
             return
-
         # Try loading cache if not in memory
         if not self.similarity_engine.documents:
             self.similarity_engine.load_cache(self.embeddings_cache)
