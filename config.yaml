@@ -1,0 +1,73 @@
+# GitHub Issue Manager Configuration
+
+# Mode: 'analysis' keys logs actions but doesn't perform them. 'action' performs them.
+mode: 'analysis'
+
+# GitHub Authentication
+# Ensure GITHUB_TOKEN environment variable is set.
+# repo_name: "unslothai/unsloth" # Example, can be passed via CLI args
+
+# Core Team Members
+# Issues where the last comment is from one of these users triggering specific follow-up logic.
+core_members:
+  - datta0
+  - danielhanchen
+  - mmathew23
+  - rolandtannous
+  - pluesclues
+  - djsaunde
+  - shimmyshimmier
+
+# Team Notification Users
+# Users to tag when an issue needs team attention (e.g., stale but new).
+team_notification_users:
+  - datta0
+  - danielhanchen
+
+# Logic Rules
+rules:
+  # Core Member Follow-up Logic
+  core_followup:
+    enabled: true
+    warn_days: 14     # Warn if inactive for 2 weeks after core member response
+    close_days: 21    # Close if inactive for 3 weeks after core member response
+
+  # General Stale Logic
+  general_stale:
+    enabled: true
+    close_days: 84    # 12 weeks -> Close immediately
+    warn_days: 28     # 4 weeks -> Warning zone
+    new_issue_window_days: 90 # Issues created within this window get "Notify Team" action instead of warn if stale
+
+# Semantic Similarity Settings
+similarity:
+  enabled: true
+  model_name: 'BAAI/bge-base-en-v1.5' # Stronger retrieval model (good for semantic match)
+  device: 'cuda' # 'cuda', 'cpu', or 'mps'
+  batch_size: 64
+  alpha: 0.5 # Weight for Dense Embeddings
+  threshold: 0.7
+  top_k: 3
+
+# Messages
+messages:
+  core_followup_warn: |
+    Hi! A core team member responded to this issue 2 weeks ago, but we haven't heard back.
+    This issue will be closed in 1 week if there is no further activity.
+
+  core_followup_close: |
+    Closing this issue due to inactivity following a core team member's response.
+    Feel free to reopen if you have more details!
+
+  general_stale_warn: |
+    This issue has been inactive for 4 weeks. It will be closed if no further activity occurs.
+
+  general_stale_close: |
+    Closing this issue as it has been inactive for over 12 weeks.
+
+  general_stale_notify_team: |
+    @datta0 @danielhanchen This issue is relatively new (created < 3 months ago) but has been inactive for 4 weeks. Please review.
+
+  similarity_comment: |
+    We found some similar issues that might help:
+    {similar_links}
