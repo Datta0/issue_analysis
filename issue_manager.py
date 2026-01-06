@@ -8,8 +8,10 @@ from github import Github, Issue, GithubException
 from tqdm import tqdm
 from similarity import HybridEngine
 
-CACHE_FILE = 'issues_cache.json'
-EMBEDDINGS_CACHE = 'embeddings_cache.pkl'
+import shutil
+
+CACHE_FILENAME = 'issues_cache.json'
+EMBEDDINGS_FILENAME = 'embeddings_cache.pkl'
 
 class IssueManager:
     def __init__(self, config_path: str = 'config.yaml', token: Optional[str] = None):
@@ -25,6 +27,11 @@ class IssueManager:
         self.g = Github(self.token, retry=0)
         self.repo_name = self.config.get('repo_name')
         self.repo = None
+
+        # Paths (initialized later in setup_paths)
+        self.output_dir = None
+        self.cache_file = None
+        self.embeddings_cache = None
 
         # Local Cache
         self.issues_map: Dict[int, Dict] = {} # Map number -> issue dict (not Object to save serialization)
@@ -42,8 +49,33 @@ class IssueManager:
         else:
             self.similarity_engine = None
 
+    def setup_paths(self, repo_name: str):
+        """Initialize output directory and cache paths based on repo name."""
+        safe_repo = repo_name.replace('/', '_')
+        self.output_dir = os.path.join('outputs', safe_repo)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.cache_file = os.path.join(self.output_dir, CACHE_FILENAME)
+        self.embeddings_cache = os.path.join(self.output_dir, EMBEDDINGS_FILENAME)
+
+        self._migrate_legacy_cache()
+
+    def _migrate_legacy_cache(self):
+        """Move root cache files to the new output directory if they exist."""
+        # Check issues cache
+        if os.path.exists(CACHE_FILENAME) and not os.path.exists(self.cache_file):
+            print(f"Migrating legacy {CACHE_FILENAME} to {self.cache_file}...")
+            shutil.move(CACHE_FILENAME, self.cache_file)
+
+        # Check embeddings cache
+        if os.path.exists(EMBEDDINGS_FILENAME) and not os.path.exists(self.embeddings_cache):
+            print(f"Migrating legacy {EMBEDDINGS_FILENAME} to {self.embeddings_cache}...")
+            shutil.move(EMBEDDINGS_FILENAME, self.embeddings_cache)
+
     def connect_repo(self, repo_name: str):
         self.repo_name = repo_name
+        self.setup_paths(repo_name) # Ensure paths are set up
+
         if self.repo is None: # Only connect if not already connected (e.g. reused)
              print(f"Connecting to repository: {repo_name}...")
              try:
@@ -53,9 +85,9 @@ class IssueManager:
                 self.repo = None
 
     def _load_cache(self):
-        if os.path.exists(CACHE_FILE):
+        if os.path.exists(self.cache_file):
             try:
-                with open(CACHE_FILE, 'r') as f:
+                with open(self.cache_file, 'r') as f:
                     data = json.load(f)
                     self.issues_map = {int(k): v for k, v in data.get('issues', {}).items()}
                     last_fetch_iso = data.get('last_fetch')
@@ -71,7 +103,7 @@ class IssueManager:
             'last_fetch': self.last_fetch.isoformat() if self.last_fetch else None
         }
         try:
-            with open(CACHE_FILE, 'w') as f:
+            with open(self.cache_file, 'w') as f:
                 json.dump(data, f)
             print("Saved issues cache.")
         except Exception as e:
@@ -88,10 +120,101 @@ class IssueManager:
             'updated_at': issue.updated_at.isoformat(),
             'html_url': issue.html_url,
             'user_login': issue.user.login,
+            'comments_count': issue.comments,
+            'unique_commenters': 1, # Default to 1 (creator) until we fetch comments
             # Placeholder for analysis fields
             'last_commenter': None,
             'last_comment_date': None
         }
+
+    # ... (fetch_issues remains mostly same, just ensuring calls use _serialize_issue)
+
+    # ...
+
+    def generate_similarity_report(self):
+        """
+        Cluster issues based on embedding similarity to find common topics.
+        """
+        print("\n" + "="*40)
+        print("SIMILARITY / CLUSTER ANALYSIS")
+        print("="*40)
+
+        # Access embeddings (Tensor on Device)
+        try:
+             import torch
+             from sentence_transformers import util
+        except ImportError:
+             print("Torch/SentenceTransformers not available for report.")
+             return
+
+        embeddings = self.similarity_engine.corpus_embeddings
+        documents = self.similarity_engine.documents
+
+        if embeddings is None or len(documents) == 0:
+             print("No embeddings to analyze.")
+             return
+
+        # Compute NxN Cosine Similarity
+        n = len(documents)
+        print(f"Clustering {n} issues...")
+
+        sim_matrix = util.cos_sim(embeddings, embeddings)
+
+        # Threshold for "Same Topic"
+        threshold = 0.85
+
+        # Greedy Clustering
+        clusters = []
+        visited = set()
+
+        # Move to CPU
+        sim_matrix = sim_matrix.cpu()
+
+        for i in range(n):
+            if i in visited:
+                continue
+
+            cluster = [i]
+            visited.add(i)
+
+            for j in range(i + 1, n):
+                if j in visited:
+                    continue
+                if sim_matrix[i][j] >= threshold:
+                    cluster.append(j)
+                    visited.add(j)
+
+            if len(cluster) > 1:
+                clusters.append(cluster)
+
+        # Smart Sorting: Impact Score = (Num Issues) + (Total Comments * 0.2)
+        # We weigh issues higher, but comments add "heat"
+        def get_cluster_stats(cluster_indices):
+            num_issues = len(cluster_indices)
+            # Note: documents might not have 'comments_count' if loaded from OLD cache
+            # We assume cache is refreshed or we default to 0
+            total_comments = sum(documents[idx].get('comments_count', 0) for idx in cluster_indices)
+            unique_authors = len(set(documents[idx]['user_login'] for idx in cluster_indices)) # Approx users
+            return num_issues, total_comments, unique_authors
+
+        clusters.sort(key=lambda c: len(c) + (sum(documents[idx].get('comments_count', 0) for idx in c) * 0.1), reverse=True)
+
+        print(f"Found {len(clusters)} clusters/topics involving {sum(len(c) for c in clusters)} issues.\n")
+
+        # Print Top 10 Clusters
+        print("Top Recurring Issues (Ranked by Impact):")
+        for idx, cluster in enumerate(clusters[:10]):
+            primary_doc_idx = cluster[0]
+            title = documents[primary_doc_idx]['title']
+            count, comments, authors = get_cluster_stats(cluster)
+
+            print(f"{idx+1}. [{count} issues | {comments} comments | ~{authors} users] Topic: '{title}'")
+
+            for c_idx in cluster[:5]:
+                 doc = documents[c_idx]
+                 c_count = doc.get('comments_count', 0)
+                 print(f"   - #{doc['number']} ({c_count} comments) {doc['title']}")
+            print("")
 
     def fetch_issues(self):
         self._load_cache()
@@ -147,9 +270,14 @@ class IssueManager:
             comments = list(gh_issue.get_comments())
             if comments:
                 last_comment = comments[-1]
+                # Calculate unique commenters
+                unique_users = set(c.user.login for c in comments)
+                unique_users.add(gh_issue.user.login) # Add creator
+
                 return {
                     'last_commenter': last_comment.user.login,
-                    'last_comment_date': last_comment.created_at.isoformat()
+                    'last_comment_date': last_comment.created_at.isoformat(),
+                    'unique_commenters': len(unique_users)
                 }
             else:
                  return {
@@ -305,11 +433,11 @@ class IssueManager:
 
         # 2. Update Similarity Index
         if self.similarity_engine:
-            cache_loaded = self.similarity_engine.load_cache(EMBEDDINGS_CACHE)
+            cache_loaded = self.similarity_engine.load_cache(self.embeddings_cache)
             # Naive re-index for working set to ensure sync
             docs = [{'number': i['number'], 'title': i['title'], 'body': i['body'], 'html_url': i['html_url']} for i in working_issues]
             self.similarity_engine.index(docs)
-            self.similarity_engine.save_cache(EMBEDDINGS_CACHE)
+            self.similarity_engine.save_cache(self.embeddings_cache)
 
         # 3. Parallel Analysis
         analyses = []
@@ -392,8 +520,6 @@ class IssueManager:
              return
 
         # Compute NxN Cosine Similarity
-        # This can be large, but for <5k issues it's fine on GPU
-        # Check size
         n = len(documents)
         print(f"Clustering {n} issues...")
 
@@ -404,26 +530,22 @@ class IssueManager:
         threshold = 0.85
 
         # Greedy Clustering
-        # List of clusters. Each cluster is list of indices.
         clusters = []
         visited = set()
 
-        # Move to CPU for loop logic
+        # Move to CPU
         sim_matrix = sim_matrix.cpu()
 
         for i in range(n):
             if i in visited:
                 continue
 
-            # Start new cluster
             cluster = [i]
             visited.add(i)
 
-            # Find all neighbors > threshold
             for j in range(i + 1, n):
                 if j in visited:
                     continue
-
                 if sim_matrix[i][j] >= threshold:
                     cluster.append(j)
                     visited.add(j)
@@ -431,20 +553,33 @@ class IssueManager:
             if len(cluster) > 1:
                 clusters.append(cluster)
 
-        # Sort clusters by size
-        clusters.sort(key=len, reverse=True)
+        # Smart Sorting: Impact Score = (Num Issues) + (Total Comments * 0.2)
+        # We weigh issues higher, but comments add "heat"
+        def get_cluster_stats(cluster_indices):
+            num_issues = len(cluster_indices)
+            # Note: documents might not have 'comments_count' if loaded from OLD cache
+            # We assume cache is refreshed or we default to 0
+            total_comments = sum(documents[idx].get('comments_count', 0) for idx in cluster_indices)
+            unique_authors = len(set(documents[idx]['user_login'] for idx in cluster_indices)) # Approx users
+            return num_issues, total_comments, unique_authors
+
+        clusters.sort(key=lambda c: len(c) + (sum(documents[idx].get('comments_count', 0) for idx in c) * 0.1), reverse=True)
 
         print(f"Found {len(clusters)} clusters/topics involving {sum(len(c) for c in clusters)} issues.\n")
 
         # Print Top 10 Clusters
-        print("Top Recurring Issues:")
+        print("Top Recurring Issues (Ranked by Impact):")
         for idx, cluster in enumerate(clusters[:10]):
-            primary_doc_idx = cluster[0] # Using first as representative
+            primary_doc_idx = cluster[0]
             title = documents[primary_doc_idx]['title']
-            print(f"{idx+1}. [{len(cluster)} issues] Topic: '{title}'")
-            # Print a few examples
+            count, comments, authors = get_cluster_stats(cluster)
+
+            print(f"{idx+1}. [{count} issues | {comments} comments | ~{authors} users] Topic: '{title}'")
+
             for c_idx in cluster[:5]:
-                 print(f"   - #{documents[c_idx]['number']} {documents[c_idx]['title']}")
+                 doc = documents[c_idx]
+                 c_count = doc.get('comments_count', 0)
+                 print(f"   - #{doc['number']} ({c_count} comments) {doc['title']}")
             print("")
 
     def find_similar_for_new(self, title: str, body: str):
@@ -454,7 +589,7 @@ class IssueManager:
 
         # Try loading cache if not in memory
         if not self.similarity_engine.documents:
-            self.similarity_engine.load_cache(EMBEDDINGS_CACHE)
+            self.similarity_engine.load_cache(self.embeddings_cache)
 
         query = f"{title} {body}"
         top_k = self.config.get('similarity', {}).get('top_k', 3)
